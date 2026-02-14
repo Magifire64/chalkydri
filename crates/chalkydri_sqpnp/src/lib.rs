@@ -1,4 +1,6 @@
-use nalgebra::{Isometry3, Point3, Rotation3, SMatrix, SVector};
+use nalgebra::{
+    Isometry3, Point3, Rotation3, SMatrix, SVector, Translation3, UnitQuaternion, Vector3,
+};
 use std::ops::AddAssign;
 
 // --- Type Definitions ---
@@ -15,20 +17,38 @@ pub type Iso3 = Isometry3<f64>;
 pub type Pnt3 = Point3<f64>;
 pub type Rot3 = Rotation3<f64>;
 
-// Standard Computer Vision to Robot (NWU: X-Forward, Y-Left, Z-Up) Rotation Matrix
-// Maps: Cam Z(Fwd) -> Rob X(Fwd), Cam X(Right) -> Rob Y(Left), Cam Y(Down) -> Rob Z(Up)
-const CAM_TO_ROBOT_ROT: Mat3 = Mat3::new(0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0);
+// --- Helper: Define Camera Offset ---
+
+/// Creates the transform defining where the Camera is located on the Robot.
+/// Returns the Isometry T_{Robot <- Camera}
+pub fn make_camera_pose(mounting_pitch_deg: f64, robot_center_to_cam: Vec3) -> Iso3 {
+    // 1. Define the rotation from Robot Frame (NWU) to Camera Optical Frame (Z-Fwd)
+    let nwu_to_optical = Mat3::new(0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0);
+    let base_rot = Rotation3::from_matrix(&nwu_to_optical);
+
+    // 2. Apply Pitch (Tilt Up/Down)
+    // Positive mounting pitch (looking up) is a Negative rotation around Y (Right Hand Rule)
+    let pitch_rad = -mounting_pitch_deg.to_radians();
+    let pitch_rot = Rotation3::from_axis_angle(&Vector3::y_axis(), pitch_rad);
+
+    let final_rot = pitch_rot * base_rot;
+
+    // FIX: Convert Rotation3 to UnitQuaternion for Isometry3
+    let quat = UnitQuaternion::from_rotation_matrix(&final_rot);
+
+    Iso3::from_parts(Translation3::from(robot_center_to_cam), quat)
+}
+
+// --- SQPnP Solver Implementation ---
 
 #[inline(always)]
 fn nearest_so3(r_vec: &Vec9) -> Vec9 {
     let m = Mat3::from_column_slice(r_vec.as_slice());
-    // SVD to orthogonalize the matrix (make it a true rotation)
     let svd = m.svd(true, true);
     let u = svd.u.unwrap_or_default();
     let vt = svd.v_t.unwrap_or_default();
 
     let mut rot = u * vt;
-    // Fix chirality (ensure determinant is +1, not -1)
     if rot.determinant() < 0.0 {
         let mut u_prime = u;
         u_prime.column_mut(2).scale_mut(-1.0);
@@ -43,7 +63,6 @@ fn constraints_and_jacobian(r_vec: &Vec9) -> (Vec6, Mat6x9) {
     let c2 = r_vec.fixed_view::<3, 1>(3, 0);
     let c3 = r_vec.fixed_view::<3, 1>(6, 0);
 
-    // Orthogonality and Normality constraints for SO(3)
     let h = Vec6::new(
         c1.norm_squared() - 1.0,
         c2.norm_squared() - 1.0,
@@ -55,14 +74,12 @@ fn constraints_and_jacobian(r_vec: &Vec9) -> (Vec6, Mat6x9) {
 
     let mut jac = Mat6x9::zeros();
 
-    // Gradient of constraints
     jac.fixed_view_mut::<1, 3>(0, 0)
         .copy_from(&(2.0 * c1.transpose()));
     jac.fixed_view_mut::<1, 3>(1, 3)
         .copy_from(&(2.0 * c2.transpose()));
     jac.fixed_view_mut::<1, 3>(2, 6)
         .copy_from(&(2.0 * c3.transpose()));
-
     jac.fixed_view_mut::<1, 3>(3, 0).copy_from(&c2.transpose());
     jac.fixed_view_mut::<1, 3>(3, 3).copy_from(&c1.transpose());
     jac.fixed_view_mut::<1, 3>(4, 0).copy_from(&c3.transpose());
@@ -75,10 +92,10 @@ fn constraints_and_jacobian(r_vec: &Vec9) -> (Vec6, Mat6x9) {
 
 #[inline(always)]
 fn solve_newton(r: &Vec9, omega: &Mat9, h: &Vec6, jac: &Mat6x9) -> Option<Vec9> {
-    // SQP (Sequential Quadratic Programming) step using KKT system
     let mut lhs = Mat15::zeros();
     lhs.fixed_view_mut::<9, 9>(0, 0).copy_from(omega);
-    lhs.fixed_view_mut::<9, 6>(0, 9).copy_from(&jac.transpose());
+    lhs.fixed_view_mut::<9, 6>(0, 9)
+        .copy_from(&jac.transpose());
     lhs.fixed_view_mut::<6, 9>(9, 0).copy_from(jac);
 
     let mut rhs = Vec15::zeros();
@@ -109,7 +126,6 @@ fn build_linear_system(points_3d: &[Vec3], points_2d: &[Vec3]) -> LinearSys {
     let mut q_tt = Mat3::zeros();
 
     for (p_3d, p_img) in points_3d.iter().zip(points_2d.iter()) {
-        // Build Projection Matrix P = I - (v*v^T)/(v^T*v)
         let sq_norm = p_img.norm_squared();
         let inv_norm = 1.0 / sq_norm;
         let v_vt = p_img * p_img.transpose();
@@ -121,12 +137,10 @@ fn build_linear_system(points_3d: &[Vec3], points_2d: &[Vec3]) -> LinearSys {
         let py = p.scale(p_3d.y);
         let pz = p.scale(p_3d.z);
 
-        // Accumulate Q_rt
         q_rt.fixed_view_mut::<3, 3>(0, 0).add_assign(&px);
         q_rt.fixed_view_mut::<3, 3>(3, 0).add_assign(&py);
         q_rt.fixed_view_mut::<3, 3>(6, 0).add_assign(&pz);
 
-        // Accumulate Q_rr
         q_rr.fixed_view_mut::<3, 3>(0, 0)
             .add_assign(&px.scale(p_3d.x));
         q_rr.fixed_view_mut::<3, 3>(3, 3)
@@ -170,7 +184,7 @@ impl Default for SqPnP {
         Self {
             max_iter: 15,
             tol_sq: 1e-16,
-            corner_distance: 0.1651f64 / 2.0, //2026 in cm
+            corner_distance: 0.1651f64 / 2.0,
         }
     }
 }
@@ -179,30 +193,34 @@ impl SqPnP {
     pub fn new() -> Self {
         Self::default()
     }
+
     pub const fn max_iter(mut self, max_iter: usize) -> Self {
         self.max_iter = max_iter;
         self
     }
+
     pub const fn tolerance(mut self, tol: f64) -> Self {
         self.tol_sq = tol * tol;
         self
     }
+
     pub fn with_tag_side_size(mut self, size: f64) -> Self {
         self.corner_distance = size / 2.0;
         self
     }
 
     /// Solves for the standard Computer Vision pose (World -> Camera).
-    /// Returns (Rotation, Translation) where P_cam = R * P_world + T
-    pub fn solve(
+    /// Returns Isometry T_{Cam <- World}
+    fn solve(
         &self,
         points_isometry: &[Isometry3<f64>],
         points_2d: &[Vec3],
         gyro: f64,
         sign_change_error: f64,
         buffer: &mut Vec<Pnt3>,
-    ) -> Option<(Rot3, Vec3)> {
+    ) -> Option<Iso3> {
         self.corner_points_from_center(points_isometry, buffer);
+
         let mut points_3d: Vec<Vec3> = Vec::with_capacity(buffer.len());
         for point in buffer {
             points_3d.push(Vec3::new(point.x, point.y, point.z));
@@ -214,21 +232,21 @@ impl SqPnP {
 
         let sys = build_linear_system(&points_3d, points_2d);
 
-        let r_mat = self.solve_rotation(&sys.omega, gyro, sign_change_error, points_2d.len() < 8);
+        let r_mat = self.solve_rotation(&sys.omega, gyro, sign_change_error);
 
-        // t = -q_tt^-1 * q_rt^T * r
         let r_vec = Vec9::from_column_slice(r_mat.as_slice());
         let t_vec = -sys.q_tt_inv * sys.q_rt.transpose() * r_vec;
 
-        let result_t_vec = Vec3::new(-t_vec.y, t_vec.x, t_vec.z);
-
+        // FIX: Create proper Rotation3 object first
         let rot = Rot3::from_matrix(&r_mat);
+        // FIX: Convert Rotation3 to UnitQuaternion for Isometry3
+        let quat = UnitQuaternion::from_rotation_matrix(&rot);
 
-        Some((rot, t_vec))
+        Some(Iso3::from_parts(Translation3::from(t_vec), quat))
     }
 
-    /// Solves for the Robot's Position in the World (Field Frame).
-    /// Handles the coordinate system change (CV -> Robot) and the PnP Inversion.
+    /// Solves for the Robot's Pose in the World.
+    /// Returns Isometry T_{World <- Robot}
     pub fn solve_robot_pose(
         &self,
         points_isometry: &[Isometry3<f64>],
@@ -236,71 +254,41 @@ impl SqPnP {
         gyro: f64,
         sign_change_error: f64,
         buffer: &mut Vec<Pnt3>,
-    ) -> Option<(Rot3, Vec3)> {
-        // 1. Get raw World-to-Camera (CV Frame)
-        // Returns T_wc (Translation from World to Cam in Cam coords)
-        let (r_wc, t_wc) =
-            self.solve(points_isometry, points_2d, gyro, sign_change_error, buffer)?;
+        cam_on_robot: &Iso3,
+    ) -> Option<Iso3> {
+        // 1. Solve PnP to get T_{Cam <- World}
+        let iso_world_to_cam = self.solve(points_isometry, points_2d, gyro, sign_change_error, buffer)?;
 
-        // 2. Invert to get Camera-to-World (CV Frame)
-        // Position of Camera in World = -R^T * T
-        // NOTE: We apply negation to the vector because Rot3 cannot be negated directly
-        let cam_pos_world = r_wc.inverse() * (-t_wc);
+        // 2. Invert to get T_{World <- Cam}
+        let iso_cam_to_world = iso_world_to_cam.inverse();
 
-        // 3. Compute Robot Rotation
-        // R_wc contains the camera axes in World Frame (Rows of R_wc):
-        // Row 0 = Cam X (Right) in World
-        // Row 1 = Cam Y (Down) in World
-        // Row 2 = Cam Z (Forward) in World
+        // 3. T_{World <- Robot} = T_{World <- Cam} * (T_{Robot <- Cam})^-1
+        let iso_cam_on_robot_inv = cam_on_robot.inverse();
+        let iso_robot_in_world = iso_cam_to_world * iso_cam_on_robot_inv;
 
-        // Robot Frame (NWU): X=Forward, Y=Left, Z=Up
-        // Mapping:
-        // Robot X (Forward) = Cam Z
-        // Robot Y (Left)    = -Cam X
-        // Robot Z (Up)      = -Cam Y
-
-        let r_wc_mat = r_wc.matrix();
-        let cam_x_in_world = r_wc_mat.row(0).transpose(); // Right
-        let cam_y_in_world = r_wc_mat.row(1).transpose(); // Down
-        let cam_z_in_world = r_wc_mat.row(2).transpose(); // Forward
-
-        let robot_x = cam_z_in_world;
-        let robot_y = -cam_x_in_world;
-        let robot_z = -cam_y_in_world;
-
-        let robot_rot_mat = Mat3::from_columns(&[robot_x, robot_y, robot_z]);
-        let robot_rot = Rotation3::from_matrix(&robot_rot_mat);
-
-        Some((robot_rot, cam_pos_world))
+        Some(iso_robot_in_world)
     }
 
-    fn corner_points_from_center(&self, isometry: &[Iso3], buffer: &mut Vec<Pnt3>) -> () {
+    fn corner_points_from_center(&self, isometry: &[Iso3], buffer: &mut Vec<Pnt3>) {
         buffer.clear();
         let s = self.corner_distance;
         isometry.iter().for_each(|iso: &Iso3| {
-            // ORDER: Clockwise starting from Bottom-Left.
-            // SYSTEM: Y increases DOWN (so +Y is Bottom, -Y is Top).
-            //         X increases RIGHT (so +X is Right, -X is Left).
-
+            // Coordinate System: Y-Down Positive, X-Right Positive.
+            // Order: Bottom Left -> Clockwise
             let corners = [
-                // 1. Bottom-Left (-X, +Y)
-                Pnt3::new(-s, s, 0.0),
-                // 2. Top-Left (-X, -Y) (Clockwise step up)
-                Pnt3::new(-s, -s, 0.0),
-                // 3. Top-Right (+X, -Y) (Clockwise step right)
-                Pnt3::new(s, -s, 0.0),
-                // 4. Bottom-Right (+X, +Y) (Clockwise step down)
-                Pnt3::new(s, s, 0.0),
+                Pnt3::new(-s, s, 0.0),  // Bottom-Left
+                Pnt3::new(-s, -s, 0.0), // Top-Left
+                Pnt3::new(s, -s, 0.0),  // Top-Right
+                Pnt3::new(s, s, 0.0),   // Bottom-Right
             ];
 
             for c in corners {
-                // Apply the tag's field pose (isometry)
                 buffer.push(iso * c);
             }
         });
     }
 
-    fn solve_rotation(&self, omega: &Mat9, gyro: f64, sign_change_error: f64, single_tag: bool) -> Mat3 {
+    fn solve_rotation(&self, omega: &Mat9, gyro: f64, sign_change_error: f64) -> Mat3 {
         let eigen = omega.symmetric_eigen();
 
         let mut best_r = Vec9::zeros();
@@ -315,15 +303,11 @@ impl SqPnP {
 
                 let test_r_mat = Mat3::from_column_slice(refined_r.as_slice());
 
-                // Gyro Check:
-                // Compare the Robot's Forward Vector (derived from solution)
-                // with the Gyro's Heading Vector.
-                // Robot Forward in World = Cam Z in World = Row 2 of R_wc
-                let robot_fwd_x = test_r_mat[(2, 0)];
-                let robot_fwd_y = test_r_mat[(2, 1)];
+                // Gyro Ambiguity Check
+                let cam_fwd_x_world = test_r_mat[(2, 0)];
+                let cam_fwd_y_world = test_r_mat[(2, 1)];
 
-                // Dot product of Robot Forward vector and Gyro vector
-                let dot = (robot_fwd_x * gyro.cos()) + (robot_fwd_y * gyro.sin());
+                let dot = (cam_fwd_x_world * gyro.cos()) + (cam_fwd_y_world * gyro.sin());
 
                 if dot < 0.0 {
                     energy += sign_change_error;
@@ -332,9 +316,6 @@ impl SqPnP {
                 if energy < min_energy {
                     min_energy = energy;
                     best_r = refined_r;
-                }
-                if min_energy < 1e-12 {
-                    break;
                 }
             }
         }
